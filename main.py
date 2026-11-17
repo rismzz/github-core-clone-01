@@ -23,6 +23,7 @@ $MAKEFUN_ENV_URL/done and exit 0 when the suite reports done.
 import base64
 import hashlib
 import hmac as hmac_mod
+import itertools
 import json
 import os
 import re
@@ -33,6 +34,7 @@ import time
 import urllib.request
 import zlib
 from difflib import SequenceMatcher
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -41,18 +43,28 @@ from urllib.parse import urlparse, parse_qs, unquote
 # --------------------------------------------------------------------------
 
 _CLOCK_BASE = 1735689600  # 2025-01-01T00:00:00Z
-_clock_lock = threading.Lock()
-_clock_seq = [0]
+_clock_seq = itertools.count(1)
 
 
 def tick():
-    with _clock_lock:
-        _clock_seq[0] += 1
-        return _CLOCK_BASE + _clock_seq[0]
+    # itertools.count.__next__ is atomic under the GIL, so the logical
+    # clock stays strictly monotonic across threads without a lock.
+    return _CLOCK_BASE + next(_clock_seq)
+
+
+_ISO_CACHE = {}
 
 
 def iso(epoch):
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+    # The same epochs recur constantly (an issue's created/updated stamps
+    # are re-serialized on every read), so memoize the formatting.
+    hit = _ISO_CACHE.get(epoch)
+    if hit is None:
+        hit = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+        if len(_ISO_CACHE) > 100000:
+            _ISO_CACHE.clear()
+        _ISO_CACHE[epoch] = hit
+    return hit
 
 
 def now_iso():
@@ -74,11 +86,21 @@ def b64e(raw):
     return base64.b64encode(raw).decode("ascii")
 
 
+_NODE_ID_PREFIXES = {"Repository": "04", "Issue": "05", "PullRequest": "06",
+                     "User": "04", "Label": "07", "IssueComment": "08"}
+_NODE_ID_CACHE = {}
+
+
 def node_id(kind, dbid):
-    # Legacy-style GitHub node ids: base64 of "0X:Type<id>".
-    prefixes = {"Repository": "04", "Issue": "05", "PullRequest": "06",
-                "User": "04", "Label": "07", "IssueComment": "08"}
-    return b64e(("%s:%s%d" % (prefixes.get(kind, "00"), kind, dbid)).encode())
+    # Legacy-style GitHub node ids: base64 of "0X:Type<id>".  Pure in
+    # (kind, dbid), and the same ids recur on every response, so memoize.
+    key = (kind, dbid)
+    hit = _NODE_ID_CACHE.get(key)
+    if hit is None:
+        hit = b64e(("%s:%s%d" % (_NODE_ID_PREFIXES.get(kind, "00"),
+                                 kind, dbid)).encode())
+        _NODE_ID_CACHE[key] = hit
+    return hit
 
 
 def parse_node_id(nid):
@@ -113,13 +135,13 @@ def store_object(otype, content):
 
 
 def get_object(sha):
-    with _objects_lock:
-        return _objects.get(sha)
+    # Lock-free read: dict lookups are atomic under the GIL and stored
+    # objects are immutable, so a reader can never observe a torn value.
+    return _objects.get(sha)
 
 
 def has_object(sha):
-    with _objects_lock:
-        return sha in _objects
+    return sha in _objects
 
 
 def parse_commit(content):
@@ -759,13 +781,27 @@ def base_url(ctx):
     return "http://" + ctx["host"]
 
 
+_USER_JSON_CACHE = {}
+
+
 def user_json(login):
+    # A user's published shape never changes once its id is assigned, so
+    # memoize it: issue/repo/pull serializers embed a user on nearly every
+    # response.  Callers must not mutate the result (rest_user copies it
+    # before adding its private fields).
+    hit = _USER_JSON_CACHE.get(login)
+    if hit is not None:
+        return hit
     u = STORE.ensure_user(login)
-    return {"login": login, "id": u["id"], "node_id": node_id("User", u["id"]),
-            "type": "User", "site_admin": False,
-            "avatar_url": "https://avatars.githubusercontent.com/u/%d" % u["id"],
-            "html_url": "https://github.com/" + login,
-            "url": "https://api.github.com/users/" + login}
+    hit = {"login": login, "id": u["id"],
+           "node_id": node_id("User", u["id"]),
+           "type": "User", "site_admin": False,
+           "avatar_url": "https://avatars.githubusercontent.com/u/%d"
+                         % u["id"],
+           "html_url": "https://github.com/" + login,
+           "url": "https://api.github.com/users/" + login}
+    _USER_JSON_CACHE[login] = hit
+    return hit
 
 
 def repo_json(ctx, repo):
@@ -1617,7 +1653,7 @@ def rest_user(ctx, method, parts, query, body):
             err(404, "Not Found")
         return 200, user_json(login), {}
     if method == "GET":
-        out = user_json(ctx["login"])
+        out = dict(user_json(ctx["login"]))  # copy: user_json is memoized
         out.update({"name": ctx["login"], "email": None, "plan": {
             "name": "free", "space": 976562499, "collaborators": 0,
             "private_repos": 10000}, "total_private_repos": 0,
@@ -2460,7 +2496,8 @@ def rest_search(ctx, method, parts, query, body):
 
 def rest_dispatch(ctx, method, path, query, raw_body):
     """Route one /api/v3 request. Returns (status, obj, headers)."""
-    parts = [unquote(p) for p in path.split("/") if p != ""]
+    parts = [unquote(p) if "%" in p else p
+             for p in path.split("/") if p != ""]
     # parts[0] == 'api', parts[1] == 'v3'
     rest = parts[2:]
     body = None
@@ -4042,9 +4079,75 @@ def mcp_handle(ctx, payload):
 # HTTP plumbing
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# HTTP plumbing fast paths
+#
+# Profiling the benchmark workloads (sdk/run.ts --perf) showed the stdlib
+# HTTP machinery, not the forge logic, dominating every request: parsing
+# headers through the email package costs ~0.2 ms of pure CPU a request,
+# and the stdlib response path formats a fresh Date header and flushes
+# header and body as two writes.  The Handler overrides below keep the
+# stdlib connection loop, dispatch and send_error surface, but parse
+# headers into a plain dict and write each response in one go.
+# --------------------------------------------------------------------------
+
+_REQ_SEQ = itertools.count(1)
+
+_DATE_CACHE = [0, ""]
+
+
+def _date_header():
+    now = int(time.time())
+    if now != _DATE_CACHE[0]:
+        _DATE_CACHE[0] = now
+        _DATE_CACHE[1] = time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                                       time.gmtime(now))
+    return _DATE_CACHE[1]
+
+
+class _Headers:
+    """Case-insensitive header lookup over a plain dict.
+
+    Stands in for the email.message.Message the stdlib handler installs
+    as self.headers; only the access patterns this server uses are
+    provided.  The first occurrence of a repeated header wins, exactly
+    as Message.get behaves.
+    """
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d):
+        self._d = d
+
+    def get(self, name, default=None):
+        return self._d.get(name.lower(), default)
+
+    def __getitem__(self, name):
+        return self._d.get(name.lower())
+
+    def __contains__(self, name):
+        return name.lower() in self._d
+
+    def get_all(self, name, default=None):
+        value = self._d.get(name.lower())
+        return [value] if value is not None else default
+
+    def items(self):
+        return self._d.items()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "forge/1.0"
+
+    _VERSION_LINE = None
+
+    def _version_line(self):
+        line = type(self)._VERSION_LINE
+        if line is None:
+            line = self.version_string()
+            type(self)._VERSION_LINE = line
+        return line
 
     def log_message(self, fmt, *args):  # keep stdout quiet
         pass
@@ -4064,6 +4167,157 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    # -- lean request parsing -------------------------------------------------
+    def handle_one_request(self):
+        """Handle a single HTTP request.
+
+        A lean stand-in for BaseHTTPRequestHandler.handle_one_request +
+        parse_request: identical request-line, version, Connection and
+        Expect semantics and the same send_error surface for malformed
+        input, but headers are parsed line by line into a plain dict
+        instead of through the email package (measured at ~0.2 ms of
+        pure CPU per request — the single largest cost on the read,
+        write and clone paths).  Input this parser rejects is input the
+        stdlib rejects too, with the same status and a closed socket.
+        """
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ''
+                self.request_version = ''
+                self.command = ''
+                self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if not self._parse_request_lean():
+                # An error code has been sent, just exit
+                return
+            mname = 'do_' + self.command
+            if not hasattr(self, mname):
+                self.send_error(
+                    HTTPStatus.NOT_IMPLEMENTED,
+                    "Unsupported method (%r)" % self.command)
+                return
+            method = getattr(self, mname)
+            method()
+            self.wfile.flush()  # actually send the response if not done
+        except TimeoutError:
+            # A read or a write timed out: discard this connection.
+            self.close_connection = True
+            return
+
+    def _parse_request_lean(self):
+        """parse_request with dict headers; see handle_one_request."""
+        self.command = None  # set in case of error on the first line
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, 'iso-8859-1')
+        requestline = requestline.rstrip('\r\n')
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith('HTTP/'):
+                    raise ValueError
+                base_version_number = version.split('/', 1)[1]
+                version_number = base_version_number.split(".")
+                if len(version_number) != 2:
+                    raise ValueError
+                if any(not c.isdigit() for c in version_number):
+                    raise ValueError("non digit in http version")
+                if any(len(c) > 10 for c in version_number):
+                    raise ValueError("unreasonable length http version")
+                version_number = int(version_number[0]), \
+                    int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and \
+                    self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(
+                    HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
+                    "Invalid HTTP version (%s)" % base_version_number)
+                return False
+            self.request_version = version
+
+        if not 2 <= len(words) <= 3:
+            self.send_error(
+                HTTPStatus.BAD_REQUEST,
+                "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != 'GET':
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+
+        # Protect against open-redirect style paths, as the stdlib does.
+        if self.path.startswith('//'):
+            self.path = '/' + self.path.lstrip('/')
+
+        headers = {}
+        last_key = None
+        count = 0
+        while True:
+            line = self.rfile.readline(65537)
+            if len(line) > 65536:
+                self.send_error(
+                    HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "Line too long")
+                return False
+            if line in (b'\r\n', b'\n', b''):
+                break
+            count += 1
+            if count > 100:
+                self.send_error(
+                    HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "Too many headers")
+                return False
+            text = str(line, 'iso-8859-1').rstrip('\r\n')
+            if text[:1] in (' ', '\t') and last_key is not None:
+                # Folded continuation line: join onto the previous value.
+                headers[last_key] = headers[last_key] + ' ' + text.strip()
+                continue
+            name, sep, value = text.partition(':')
+            if not sep:
+                self.send_error(
+                    HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "Too many headers")
+                return False
+            key = name.strip().lower()
+            if key not in headers:
+                headers[key] = value.strip()
+            last_key = key
+        self.headers = _Headers(headers)
+
+        conntype = self.headers.get('Connection', "")
+        if conntype.lower() == 'close':
+            self.close_connection = True
+        elif (conntype.lower() == 'keep-alive' and
+                self.protocol_version >= "HTTP/1.1"):
+            self.close_connection = False
+        expect = self.headers.get('Expect', "")
+        if (expect.lower() == "100-continue" and
+                self.protocol_version >= "HTTP/1.1" and
+                self.request_version >= "HTTP/1.1"):
+            # The stdlib's handle_expect_100 sends exactly this.
+            self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        return True
+
     # -- plumbing helpers ---------------------------------------------------
     def _read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -4073,18 +4327,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, status, body, content_type="application/json",
               extra=None):
+        # One write for the whole response (two for a large body, where
+        # copying it just to append the head would cost more than the
+        # extra syscall).  The stdlib path formatted a Date header per
+        # request and flushed headers and body separately; the header
+        # set and its order are unchanged (Server, Date, Content-Type,
+        # Content-Length, then the caller's extras).
         if isinstance(body, (dict, list)):
-            body = json.dumps(body).encode()
+            body = json.dumps(body, separators=(",", ":")).encode()
         elif isinstance(body, str):
             body = body.encode()
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if body:
+        reason = self.responses.get(status, ("???",))[0]
+        head = ("HTTP/1.1 %d %s\r\nServer: %s\r\nDate: %s\r\n"
+                "Content-Type: %s\r\nContent-Length: %d\r\n"
+                % (status, reason, self._version_line(), _date_header(),
+                   content_type, len(body)))
+        if extra:
+            for k, v in extra.items():
+                head += "%s: %s\r\n" % (k, v)
+        head = (head + "\r\n").encode("latin-1")
+        if len(body) > 65536:
+            self.wfile.write(head)
             self.wfile.write(body)
+        elif body:
+            self.wfile.write(head + body)
+        else:
+            self.wfile.write(head)
 
     def _auth(self):
         """Return (token, login) or (None, None). Accepts Bearer and Basic
@@ -4117,16 +4385,24 @@ class Handler(BaseHTTPRequestHandler):
                                                          "localhost")}
 
     def _request_id(self):
-        with STORE.lock:
-            STORE.request_seq += 1
-            seq = STORE.request_seq
+        seq = next(_REQ_SEQ)
         return "%04X:%04X:0000000000000000" % (seq, seq * 7 % 0xFFFF)
 
     # -- main entry ---------------------------------------------------------
     def _handle(self, method):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        query = parse_qs(parsed.query)
+        # Split the request target by hand: urlparse + parse_qs build
+        # several objects per request, and the bench paths carry no
+        # query string at all.  Absolute-form targets (a proxy-style
+        # request line) get the same treatment urlparse gave them.
+        target = self.path
+        if "#" in target:
+            target = target.split("#", 1)[0]
+        if target.startswith(("http://", "https://")):
+            authority = target.split("://", 1)[1]
+            slash = authority.find("/")
+            target = authority[slash:] if slash >= 0 else "/"
+        path, sep, qs = target.partition("?")
+        query = parse_qs(qs) if sep else {}
         try:
             if path.startswith("/api/v3"):
                 self._handle_rest(method, path, query)
@@ -4239,10 +4515,8 @@ class Handler(BaseHTTPRequestHandler):
         session_headers = {}
         if isinstance(payload, dict) and \
                 payload.get("method") == "initialize":
-            with STORE.lock:
-                STORE.request_seq += 1
-                seq = STORE.request_seq
-            session_headers["Mcp-Session-Id"] = "forge-session-%d" % seq
+            session_headers["Mcp-Session-Id"] = \
+                "forge-session-%d" % next(_REQ_SEQ)
         if isinstance(payload, list):
             out = []
             for item in payload:
@@ -4355,6 +4629,10 @@ def suite_poll_done(server):
 
 
 def main():
+    # The clone bench fires 50 concurrent connections at a thread-per-
+    # connection server; a longer GIL switch interval cuts the context-
+    # switch churn between those worker threads measurably.
+    sys.setswitchinterval(0.1)
     port_env = os.environ.get("FORGE_PORT") or os.environ.get("PORT")
     port = int(port_env) if port_env else 0
     if port == 8080:

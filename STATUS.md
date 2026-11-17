@@ -290,6 +290,58 @@ pulls 20, graphql 20, mcp 15, protocol 5) + 4 workload; boot mode suite
 exit 0) lolos; `git clone` tag annotated terverifikasi mengandung
 objek tag. Tidak ada perubahan ke README.md / LICENSE / `.makefun/`.
 
+## Round 3 (improver, 2026-11-17, sesi ini — belum commit/submit)
+
+Fokus tunggal: 28 poin perf yang hilang di round 2 (push sudah 50/50).
+cProfile jalur read (hammer keep-alive 4.000 request) menunjukkan
+mesin HTTP stdlib — bukan logika forge — mendominasi tiap request:
+parsing header via paket email ~0,19 ms/request, dua `sendall` per
+respons, header Date via `time.strftime` per request, lock store
+global di balik `_request_id`, dan rebuild per panggilan di
+`node_id` / `user_json`.
+
+Diubah di `main.py` (semua behavior-preserving, diverifikasi runner):
+
+- `handle_one_request` / `_parse_request_lean` ramping di Handler:
+  semantik request-line/versi/Connection/Expect dan permukaan
+  `send_error` yang sama (400/414/431/501/505; teruji raw-socket),
+  tapi header di-parse baris-per-baris ke dict di balik adapter
+  `_Headers` (kemunculan pertama menang, seperti `Message.get`).
+  Parser email hilang total dari profil.
+- `_send` menyusun status line + header manual (string Server
+  ter-cache, Date ter-cache per detik) dan menulis head+body dalam
+  SATU write (dua untuk body > 64 KiB); JSON memakai separator kompak.
+- Counter lock-free via `itertools.count`: `tick()`, `_request_id`,
+  dan seq sesi MCP tidak lagi mengambil `STORE.lock`.
+- Memoisasi serializer murni: `node_id`, `user_json` (`rest_user`
+  diperbaiki menyalin dict sebelum menambah field privat), `iso()`.
+- Baca objek lock-free (`get_object`/`has_object` = baca dict biasa;
+  objek tersimpan immutable), split target request manual di
+  `_handle` (tanpa `urlparse`/`parse_qs` bila tak ada query string),
+  `unquote` dilewati untuk segmen path tanpa `%`.
+- `sys.setswitchinterval(0.1)` di `main()` — 50 thread clone konkuren
+  mengurangi churn GIL.
+
+Terukur dengan runner resmi, A/B melawan kode round 2 dari git,
+server fresh bergantian di VM yang sama (sedang sibuk):
+
+| workload | r2 p50     | r3 p50     | r2 pts | r3 pts |
+|----------|-----------|-----------|--------|--------|
+| push     | 1302,0 ms | 583,8 ms  | 29     | 44     |
+| clone    | 467,6 ms  | 284,2 ms  | 15     | 24     |
+| read     | 3423,5 ms | 2180,7 ms | 21     | 29     |
+| write    | 308,7 ms  | 235,1 ms  | 27     | 32     |
+
+Total perf 92 → 123–125 di bawah beban (round 2 terukur 172 di VM ini
+pada jendela sepi, jadi round 3 seharusnya jelas di atas itu di jendela
+yang sama). Conformance tetap 120/120 di semua run. Mikro-benchmark
+(klien Python keep-alive): GET minimal p50 0,394 → 0,199 ms; GET issue
+p50 0,413 → 0,274 ms.
+
+Gotcha: JANGAN menjalankan suite penuh dua kali ke proses server yang
+sama — conformance runtuh (tabrakan state); restart server fresh
+sebelum setiap pengukuran runner penuh.
+
 ## Sisa kebutuhan submit (di luar sesi bangun ini)
 
 1. Repo GitHub **publik** milik akun pengguna, dibuat setelah
