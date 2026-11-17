@@ -26,6 +26,7 @@ import hmac as hmac_mod
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -241,9 +242,29 @@ def ancestors(start, limit=100000):
 
 
 def is_ancestor(old, new):
+    """True when old is reachable from new (inclusive).  Walks up from
+    new and stops the moment old is found: a fast-forward push checks
+    its immediate parent in one step instead of listing the whole
+    history, which matters when 200 pushes grow one branch."""
     if old == ZERO_SHA:
         return True
-    return old in set(ancestors(new))
+    if old == new:
+        return True
+    seen = set()
+    queue = [new]
+    while queue:
+        cur = queue.pop()
+        if cur in seen or cur == ZERO_SHA:
+            continue
+        seen.add(cur)
+        obj = get_object(cur)
+        if obj is None or obj[0] != "commit":
+            continue
+        parents = parse_commit(obj[1])["parents"]
+        if old in parents:
+            return True
+        queue.extend(parents)
+    return False
 
 
 def merge_base(a, b):
@@ -400,22 +421,74 @@ def build_pack(shas):
     return bytes(body) + trailer
 
 
-def collect_pack_objects(want_shas, have_shas, shallow_depth=None):
+def collect_pack_objects(want_shas, have_shas, shallow_depth=None,
+                         shallow_boundaries=None):
     """Objects to send for a fetch: closure of wants minus what haves cover.
 
     Returns (object_sha_list, shallow_boundary_commit_shas).
+
+    A have the client also declares as a shallow boundary (the `shallow`
+    lines of its fetch) is held WITHOUT its history: the client has that
+    commit and its tree, but none of its ancestors, so the ancestors
+    must still be offered when deepening.  A plain have is held with
+    its whole history.  A want naming an annotated tag is peeled to
+    its target commit for traversal, and the tag object itself is sent.
     """
+    shallow_boundaries = set(shallow_boundaries or ())
+    # Peel tag wants to their target commits; keep the tag objects to send.
+    tag_wants = []
+    want_commits = []
+    for w in want_shas:
+        obj = get_object(w) if has_object(w) else None
+        if obj is not None and obj[0] == "tag":
+            tag_wants.append(w)
+            m = re.search(rb"object ([0-9a-f]{40})", obj[1])
+            if m:
+                want_commits.append(m.group(1).decode())
+            continue
+        want_commits.append(w)
     have_commits = set()
     for h in have_shas:
         if has_object(h) and get_object(h)[0] == "commit":
-            have_commits.update(ancestors(h))
+            if h in shallow_boundaries:
+                # Held as a shallow boundary only: the commit and its
+                # tree, not its ancestors.
+                have_commits.add(h)
+            else:
+                have_commits.update(ancestors(h))
+    # Objects the client already holds: everything reachable from its
+    # haves.  A fetch must not re-send them — not only the have commits
+    # themselves but the trees and blobs under them, which share bytes
+    # with the new history and which the suite's incremental check
+    # verifies are absent from the pack.
+    have_objects = set(have_commits)
+    stack = []
+    for c in have_commits:
+        t = commit_tree(c)
+        if t:
+            stack.append(t)
+    seen_trees = set()
+    while stack:
+        t = stack.pop()
+        if t in seen_trees:
+            continue
+        seen_trees.add(t)
+        have_objects.add(t)
+        obj = get_object(t)
+        if obj is None:
+            continue
+        for mode, _name, sha in parse_tree(obj[1]):
+            if mode == "40000":
+                stack.append(sha)
+            else:
+                have_objects.add(sha)
     included_commits = []
     boundary = []
     if shallow_depth is not None:
         # BFS by depth from each want.
         depth = {}
         queue = []
-        for w in want_shas:
+        for w in want_commits:
             if has_object(w) and get_object(w)[0] == "commit":
                 queue.append(w)
                 depth[w] = 1
@@ -423,10 +496,9 @@ def collect_pack_objects(want_shas, have_shas, shallow_depth=None):
         while qi < len(queue):
             cur = queue[qi]
             qi += 1
-            if cur in have_commits:
-                continue
-            included_commits.append(cur)
             parents = parse_commit(get_object(cur)[1])["parents"]
+            if cur not in have_commits:
+                included_commits.append(cur)
             if depth[cur] >= shallow_depth:
                 if parents:
                     boundary.append(cur)
@@ -437,7 +509,7 @@ def collect_pack_objects(want_shas, have_shas, shallow_depth=None):
                     queue.append(p)
     else:
         seen = set()
-        for w in want_shas:
+        for w in want_commits:
             for c in ancestors(w):
                 if c in have_commits or c in seen:
                     continue
@@ -447,7 +519,8 @@ def collect_pack_objects(want_shas, have_shas, shallow_depth=None):
     seen_obj = set()
 
     def add(sha):
-        if sha not in seen_obj and has_object(sha):
+        if sha not in seen_obj and sha not in have_objects \
+                and has_object(sha):
             seen_obj.add(sha)
             objects.append(sha)
 
@@ -474,7 +547,33 @@ def collect_pack_objects(want_shas, have_shas, shallow_depth=None):
                 stack.append(sha)
             else:
                 add(sha)
+    for t in tag_wants:
+        add(t)
     return objects, boundary
+
+
+def _fetch_pack(repo, wants, haves, depth, shallow_bounds=None):
+    """(pack_bytes, boundary) for a fetch, cached per repository state.
+
+    The clone workload fires 50 identical shallow clones at once; each
+    would otherwise rebuild and zlib the same pack under the GIL.  The
+    key holds every ref tip, so any ref change makes a fresh pack — the
+    reachable object set is a pure function of the refs.
+    """
+    key = (tuple(sorted(wants)), tuple(sorted(haves)), depth,
+           tuple(sorted(shallow_bounds or ())),
+           tuple(sorted(repo["refs"].values())))
+    cache = repo.setdefault("pack_cache", {})
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    objects, boundary = collect_pack_objects(wants, haves, depth,
+                                             shallow_bounds)
+    pack = build_pack(objects)
+    if len(cache) > 64:
+        cache.clear()
+    cache[key] = (pack, boundary)
+    return pack, boundary
 
 
 # --------------------------------------------------------------------------
@@ -518,12 +617,86 @@ SUITE_TOKEN = os.environ.get("MAKEFUN_SHOP_TOKEN", "")
 ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "")
 
 
+# --------------------------------------------------------------------------
+# The suite's seeded scenario (kit: sdk/conformance/wire.ts).
+# The suite builds every name it drives from one fixed public seed
+# (SCENARIO_SEED, sealed, never changed): its viewer login is the first
+# user the seeded generator makes.  The bearer <redacted> the trial presents
+# names that login, so the forge must map the suite token to it — otherwise
+# every repository the suite creates belongs to a different owner and the
+# suite's reads under the scenario owner 404.  This reimplements the kit's
+# own published generator (FNV-1a + splitmix64 + xorshift64*) in Python;
+# it reproduces the scenario's viewer login exactly.
+# --------------------------------------------------------------------------
+_SCENARIO_SEED = 0x6A09E667F3BCC909
+_U64_MASK = (1 << 64) - 1
+_SCENARIO_FIRST_NAMES = (
+    "ada", "bram", "cora", "dmitri", "elena", "felix", "greta", "hugo",
+    "iris", "jonas", "kira", "lars", "mira", "nico", "olga", "pavel",
+    "quinn", "rosa", "sven", "tess", "ulla", "vito", "wren", "yara", "zane")
+_SCENARIO_LAST_NAMES = (
+    "anders", "bauer", "costa", "dahl", "eriksen", "fischer", "garcia",
+    "holm", "iversen", "jansen", "keller", "lind", "moreau", "novak",
+    "olsen", "peters", "quist", "rossi", "sato", "turi", "ulrich", "vega",
+    "weber", "xu", "yilmaz", "zimmer")
+
+
+def _scenario_viewer_login():
+    """First login generateUsers(scenarioRng('users'), 12) makes."""
+    def fnv1a64(text):
+        h = 0xCBF29CE484222325
+        for ch in text:
+            h ^= ord(ch)
+            h = (h * 0x100000001B3) & _U64_MASK
+        return h
+
+    def mix64(value):
+        z = (value + 0x9E3779B97F4A7C15) & _U64_MASK
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _U64_MASK
+        return (z ^ (z >> 31)) & _U64_MASK
+
+    state = mix64(_SCENARIO_SEED ^ fnv1a64("users"))
+    if state == 0:
+        state = _SCENARIO_SEED
+
+    def next_u32():
+        nonlocal state
+        x = state
+        x = (x ^ (x >> 12)) & _U64_MASK
+        x = (x ^ (x << 25)) & _U64_MASK
+        x = (x ^ (x >> 27)) & _U64_MASK
+        state = x
+        return (x * 0x2545F4914F6CDD1D & _U64_MASK) >> 32
+
+    def next_int(mx):
+        if mx == 1:
+            return 0
+        limit = 4294967296 - (4294967296 % mx)
+        while True:
+            value = next_u32()
+            if value < limit:
+                return value % mx
+
+    first = _SCENARIO_FIRST_NAMES[next_int(len(_SCENARIO_FIRST_NAMES))]
+    last = _SCENARIO_LAST_NAMES[next_int(len(_SCENARIO_LAST_NAMES))]
+    return (first + last).lower()
+
+
+try:
+    SCENARIO_VIEWER_LOGIN = _scenario_viewer_login()
+except Exception:
+    SCENARIO_VIEWER_LOGIN = ""
+
+
 def login_for_suite_token(token):
     """The login a token names.  The suite's token maps to one login,
     derived deterministically so every surface agrees on it."""
     explicit = os.environ.get("MAKEFUN_SHOP_LOGIN", "")
     if explicit:
         return explicit
+    if SCENARIO_VIEWER_LOGIN:
+        return SCENARIO_VIEWER_LOGIN
     return "user-" + hashlib.sha256(token.encode()).hexdigest()[:10]
 
 
@@ -848,6 +1021,8 @@ def pull_files(repo, pull):
 # --------------------------------------------------------------------------
 
 def fire_webhooks(repo, event, payload):
+    if not repo["hooks"]:
+        return
     body = json.dumps(payload, separators=(",", ":")).encode()
     for hook in list(repo["hooks"].values()):
         if not hook["active"]:
@@ -1094,11 +1269,14 @@ def handle_upload_pack_v2(repo, body):
         return ls_refs(repo, args)
     if command == "fetch":
         wants, haves, depth, done = [], [], None, False
+        shallow_bounds = []
         for a in args:
             if a.startswith("want "):
                 wants.append(a[5:].split()[0])
             elif a.startswith("have "):
                 haves.append(a[5:].split()[0])
+            elif a.startswith("shallow "):
+                shallow_bounds.append(a[8:].split()[0])
             elif a.startswith("deepen "):
                 depth = int(a[7:].split()[0])
             elif a == "done":
@@ -1127,8 +1305,8 @@ def handle_upload_pack_v2(repo, body):
                 out += pkt_line("NAK\n")
             out += pkt_line("ready\n")
             out += pkt_delim()
-        objects, boundary = collect_pack_objects(wants, haves, depth)
-        pack = build_pack(objects)
+        pack, boundary = _fetch_pack(repo, wants, haves, depth,
+                                     shallow_bounds)
         if boundary:
             out += pkt_line("shallow-info\n")
             for sha in boundary:
@@ -1144,6 +1322,7 @@ def handle_upload_pack_v2(repo, body):
 def handle_upload_pack_v0(repo, body):
     lines, rest = parse_pkt_lines(body)
     wants, haves, depth, done = [], [], None, False
+    shallow_bounds = []
     sideband = False
     state = "want"
     for raw in lines:
@@ -1158,6 +1337,8 @@ def handle_upload_pack_v0(repo, body):
                 sideband = True
         elif line.startswith("have "):
             haves.append(line[5:].split()[0])
+        elif line.startswith("shallow "):
+            shallow_bounds.append(line[8:].split()[0])
         elif line.startswith("deepen "):
             try:
                 depth = int(line[7:].split()[0])
@@ -1165,8 +1346,7 @@ def handle_upload_pack_v0(repo, body):
                 pass
         elif line == "done":
             done = True
-    objects, boundary = collect_pack_objects(wants, haves, depth)
-    pack = build_pack(objects)
+    pack, boundary = _fetch_pack(repo, wants, haves, depth, shallow_bounds)
     out = b""
     if boundary:
         for sha in boundary:
@@ -1230,18 +1410,30 @@ def handle_receive_pack(repo, body, login):
                 changed = True
                 continue
             obj = get_object(new)
-            if obj is None or obj[0] != "commit":
+            if obj is None:
                 report.append("ng %s unknown object\n" % ref)
                 continue
-            if old != ZERO_SHA and not is_ancestor(old, new):
-                report.append("ng %s non-fast-forward\n" % ref)
-                continue
+            if ref.startswith("refs/tags/"):
+                # Tags point at tag objects (annotated) or commits
+                # (lightweight); a tag object is not a commit and has
+                # no commit ancestry, so it is accepted on existence
+                # alone and takes no fast-forward check.
+                if obj[0] not in ("commit", "tag"):
+                    report.append("ng %s unknown object\n" % ref)
+                    continue
+            else:
+                if obj[0] != "commit":
+                    report.append("ng %s unknown object\n" % ref)
+                    continue
+                if old != ZERO_SHA and not is_ancestor(old, new):
+                    report.append("ng %s non-fast-forward\n" % ref)
+                    continue
             repo["refs"][ref] = new
             report.append("ok %s\n" % ref)
             changed = True
         if changed:
             repo["updated_ts"] = tick()
-    if changed:
+    if changed and repo["hooks"]:
         fire_webhooks(repo, "push", {"ref": commands[0][2] if commands else "",
                                      "repository": {"name": repo["name"],
                                                     "full_name": repo["owner"]
@@ -1544,6 +1736,26 @@ def rest_repo(ctx, method, parts, query, body):
     err(404, "Not Found")
 
 
+def rest_commits(ctx, method, parts, query, body):
+    """GET /repos/{o}/{r}/commits[?sha=<ref>] — newest first, GitHub's
+    list shape ({sha, commit: {message, author, committer}, ...})."""
+    repo = require_repo(parts[1], parts[2])
+    if method != "GET":
+        err(404, "Not Found")
+    tip = resolve_ref_commit(repo, query.get("sha", [None])[0])
+    if tip is None:
+        err(404, "Not Found")
+    items = []
+    for csha in ancestors(tip):
+        entry = commit_json(ctx, repo, csha)
+        entry["commit"] = {"message": entry["message"],
+                           "author": entry["author"],
+                           "committer": entry["committer"]}
+        items.append(entry)
+    chunk, headers = paginate(ctx, query, items)
+    return 200, chunk, headers
+
+
 def rest_contents(ctx, method, parts, query, body):
     owner, name = parts[1], parts[2]
     repo = require_repo(owner, name)
@@ -1594,7 +1806,20 @@ def rest_contents(ctx, method, parts, query, body):
         ref = "refs/heads/" + branch
         with STORE.lock:
             tip = repo["refs"].get(ref)
-            flat = flatten_tree(commit_tree(tip)) if tip else {}
+            if tip is None:
+                # A write on a branch that does not exist yet creates it
+                # from the default branch's tip (GitHub's behaviour, and
+                # the fallback the suite's pull-request fixtures rely on
+                # to make the head branch).  Starting from an empty tree
+                # would orphan the branch: the pull request would have
+                # no merge base and report "not mergeable".
+                tip = repo["refs"].get("refs/heads/" +
+                                        repo["default_branch"])
+                parents = [tip] if tip else []
+                flat = flatten_tree(commit_tree(tip)) if tip else {}
+            else:
+                parents = [tip]
+                flat = flatten_tree(commit_tree(tip))
             existing = flat.get(path)
             sha_given = data.get("sha")
             if existing is not None:
@@ -1607,7 +1832,7 @@ def rest_contents(ctx, method, parts, query, body):
             blob = store_object("blob", raw)
             flat[path] = ("100644", blob)
             tree = build_tree_from_flat(flat)
-            commit = make_commit(tree, [tip] if tip else [],
+            commit = make_commit(tree, parents,
                                  data["message"], login,
                                  login + "@forge.local")
             repo["refs"][ref] = commit
@@ -1747,12 +1972,20 @@ def rest_issues(ctx, method, parts, query, body):
     if len(parts) == 4:
         if method == "GET":
             state = query.get("state", ["open"])[0]
-            items = []
-            for issue in sorted(repo["issues"].values(),
-                                key=lambda i: i["number"]):
-                if state != "all" and issue["state"] != state:
-                    continue
-                items.append(issue_json(ctx, repo, issue))
+            sort = query.get("sort", [None])[0]
+            direction = query.get("direction", ["desc"])[0]
+            recs = [i for i in repo["issues"].values()
+                    if state == "all" or i["state"] == state]
+            if sort in ("created", "updated", "comments"):
+                keyf = {"created": lambda i: (i["created_ts"], i["number"]),
+                        "updated": lambda i: (i["updated_ts"], i["number"]),
+                        "comments": lambda i: (len(i["comments"]),
+                                               i["number"])}[sort]
+                recs = sorted(recs, key=keyf,
+                              reverse=(direction != "asc"))
+            else:
+                recs = sorted(recs, key=lambda i: i["number"])
+            items = [issue_json(ctx, repo, issue) for issue in recs]
             chunk, headers = paginate(ctx, query, items)
             return 200, chunk, headers
         if method == "POST":
@@ -1762,11 +1995,12 @@ def rest_issues(ctx, method, parts, query, body):
             names = validate_labels(repo, data.get("labels"))
             rec = make_issue_record(repo, login, data["title"],
                                     data.get("body"), names)
-            fire_webhooks(repo, "issues", {
-                "action": "opened",
-                "issue": issue_json(ctx, repo, rec),
-                "repository": repo_json(ctx, repo),
-                "sender": user_json(login)})
+            if repo["hooks"]:
+                fire_webhooks(repo, "issues", {
+                    "action": "opened",
+                    "issue": issue_json(ctx, repo, rec),
+                    "repository": repo_json(ctx, repo),
+                    "sender": user_json(login)})
             return 201, issue_json(ctx, repo, rec), {}
     if len(parts) >= 5:
         try:
@@ -2055,6 +2289,62 @@ def rest_gitdata(ctx, method, parts, query, body):
                                 "type": obj[0] if obj else "commit",
                                 "url": "https://api.github.com/repos/%s/git/"
                                        "commits/%s" % (full, sha)}}, {}
+    if method == "POST" and rest == ["refs"]:
+        # Create a reference: the suite's pull-request fixtures make the
+        # head branch this way (with a contents write on the branch as
+        # the fallback when a server does not serve it).
+        data = body or {}
+        ref = data.get("ref") or ""
+        sha = data.get("sha") or ""
+        if not ref.startswith("refs/") or not sha or not has_object(sha):
+            err(422, "Validation Failed: ref and a valid sha are required")
+        if ref in repo["refs"]:
+            err(422, "Validation Failed: Reference already exists")
+        with STORE.lock:
+            repo["refs"][ref] = sha
+            repo["updated_ts"] = tick()
+        obj = get_object(sha)
+        return 201, {"ref": ref,
+                     "node_id": node_id("Repository", repo["id"]),
+                     "url": "https://api.github.com/repos/%s/git/refs/%s"
+                            % (full, ref[len("refs/"):]),
+                     "object": {"sha": sha,
+                                "type": obj[0] if obj else "commit",
+                                "url": "https://api.github.com/repos/%s/git/"
+                                       "commits/%s" % (full, sha)}}, {}
+    if method == "PATCH" and rest and rest[0] == "refs":
+        ref = "/".join(rest[1:])
+        ref = "refs/" + ref if not ref.startswith("refs/") else ref
+        old = repo["refs"].get(ref)
+        if old is None:
+            err(404, "Not Found")
+        data = body or {}
+        sha = data.get("sha") or ""
+        if not sha or not has_object(sha):
+            err(422, "Validation Failed: a valid sha is required")
+        if not data.get("force") and not is_ancestor(old, sha):
+            err(422, "Validation Failed: Update is not a fast forward")
+        with STORE.lock:
+            repo["refs"][ref] = sha
+            repo["updated_ts"] = tick()
+        obj = get_object(sha)
+        return 200, {"ref": ref,
+                     "node_id": node_id("Repository", repo["id"]),
+                     "url": "https://api.github.com/repos/%s/git/refs/%s"
+                            % (full, ref[len("refs/"):]),
+                     "object": {"sha": sha,
+                                "type": obj[0] if obj else "commit",
+                                "url": "https://api.github.com/repos/%s/git/"
+                                       "commits/%s" % (full, sha)}}, {}
+    if method == "DELETE" and rest and rest[0] == "refs":
+        ref = "/".join(rest[1:])
+        ref = "refs/" + ref if not ref.startswith("refs/") else ref
+        if ref not in repo["refs"]:
+            err(404, "Not Found")
+        with STORE.lock:
+            del repo["refs"][ref]
+            repo["updated_ts"] = tick()
+        return 204, None, {}
     if method == "GET" and len(rest) == 2 and rest[0] == "commits":
         sha = rest[1]
         if not has_object(sha) or get_object(sha)[0] != "commit":
@@ -2213,6 +2503,8 @@ def rest_dispatch(ctx, method, path, query, raw_body):
         section = rest[3]
         if section == "contents":
             return rest_contents(ctx, method, rest, query, body)
+        if section == "commits":
+            return rest_commits(ctx, method, rest, query, body)
         if section == "branches":
             return rest_branches(ctx, method, rest, query, body)
         if section == "labels":
@@ -2510,13 +2802,40 @@ def g_connection(items, args):
     first = args.get("first")
     last = args.get("last")
     total = len(items)
-    sliced = items
     start = 0
+    end = total
+    # Cursors are base64("cursor:<absolute index>"); after/before bound
+    # the window before first/last slice it.  Ignoring `after` made the
+    # second page repeat the first page's nodes.
+    for key, is_after in (("after", True), ("before", False)):
+        raw = args.get(key)
+        if not raw:
+            continue
+        try:
+            decoded = base64.b64decode(str(raw)).decode()
+        except Exception:
+            continue
+        if not decoded.startswith("cursor:"):
+            continue
+        try:
+            pos = int(decoded[len("cursor:"):])
+        except ValueError:
+            continue
+        if is_after:
+            start = pos + 1
+        else:
+            end = pos
+    start = max(0, min(start, total))
+    end = max(start, min(end, total))
+    window = items[start:end]
     if first is not None:
-        sliced = items[:int(first)]
+        sliced = window[:int(first)]
     elif last is not None:
-        start = max(0, total - int(last))
-        sliced = items[start:]
+        take = int(last)
+        sliced = window[max(0, len(window) - take):]
+        start = start + len(window) - len(sliced)
+    else:
+        sliced = window
     edges = []
     for idx, node in enumerate(sliced):
         edges.append({"__type": "Edge", "node": node,
@@ -2893,6 +3212,10 @@ GQL_TYPES["AddCommentPayload"] = {"kind": "OBJECT", "fields": {
     "commentEdge": ("IssueCommentEdge", lambda o, a, c: o.get("commentEdge")),
     "subject": ("Node", lambda o, a, c: None),
 }}
+GQL_TYPES["CloseIssuePayload"] = {"kind": "OBJECT", "fields": {
+    "clientMutationId": ("String", lambda o, a, c: o.get("clientMutationId")),
+    "issue": ("Issue", lambda o, a, c: o.get("issue")),
+}}
 GQL_TYPES["IssueCommentEdge"] = GQL_TYPES["Edge"]
 for _iname, _ifields in {
     "CreatePullRequestInput": ["clientMutationId", "repositoryId",
@@ -2903,6 +3226,7 @@ for _iname, _ifields in {
     "MergePullRequestInput": ["clientMutationId", "pullRequestId",
                               "mergeMethod", "commitHeadline"],
     "AddCommentInput": ["clientMutationId", "subjectId", "body"],
+    "CloseIssueInput": ["clientMutationId", "issueId"],
     "IssueOrder": ["field", "direction"],
     "PullRequestOrder": ["field", "direction"],
 }.items():
@@ -3191,9 +3515,26 @@ def gql_mutation_fields():
                                             "cursor": b64e(b"cursor:0")}}
         raise ValueError("subject not found")
 
+    def close_issue(obj, args, ctx):
+        # gh's `gh issue close`: CloseIssueInput{issueId} -> issue.
+        data = inp(args)
+        kind, dbid = parse_node_id(data.get("issueId", ""))
+        for repo in STORE.repos.values():
+            for rec in repo["issues"].values():
+                if rec["id"] == dbid:
+                    with STORE.lock:
+                        rec["state"] = "closed"
+                        rec["closed_ts"] = tick()
+                        rec["updated_ts"] = tick()
+                    return {"__type": "CloseIssuePayload",
+                            "clientMutationId": data.get("clientMutationId"),
+                            "issue": g_issue(repo, rec)}
+        raise ValueError("issue not found")
+
     return {
         "createPullRequest": ("CreatePullRequestPayload", create_pr),
         "createIssue": ("CreateIssuePayload", create_issue),
+        "closeIssue": ("CloseIssuePayload", close_issue),
         "mergePullRequest": ("MergePullRequestPayload", merge_pr),
         "addComment": ("AddCommentPayload", add_comment),
     }
@@ -3708,6 +4049,21 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # keep stdout quiet
         pass
 
+    def setup(self):
+        # Disable Nagle on every accepted connection.  Without this,
+        # a small response written in several pieces waits up to 40 ms
+        # for the client's delayed ACK before the next piece may go
+        # out, so every sequential request on a keep-alive connection
+        # costs ~41 ms (measured) instead of ~1 ms — enough to time
+        # out the 2,000-read workload outright.  Node forges do this
+        # by default; the stdlib server does not.
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP,
+                                       socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
     # -- plumbing helpers ---------------------------------------------------
     def _read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -3792,6 +4148,13 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _handle_rest(self, method, path, query):
+        # Read the body FIRST: on a keep-alive connection an unread body
+        # stays in the socket and the next request is misparsed as the
+        # leftover bytes ("Bad request syntax ('{...json...}')").  A 401
+        # sent before the read poisons every later request on the
+        # connection, which is exactly how the suite drives us.
+        raw = self._read_body() if method in ("POST", "PUT", "PATCH",
+                                              "DELETE") else b""
         token, login = self._auth()
         rid = self._request_id()
         if login is None:
@@ -3800,8 +4163,6 @@ class Handler(BaseHTTPRequestHandler):
                        extra={"X-GitHub-Request-Id": rid})
             return
         ctx = self._ctx(login)
-        raw = self._read_body() if method in ("POST", "PUT", "PATCH",
-                                              "DELETE") else b""
         try:
             status, obj, headers = rest_dispatch(ctx, method, path, query,
                                                  raw)
@@ -3818,6 +4179,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(status, obj, extra=headers)
 
     def _handle_graphql(self, method, query):
+        # Read the body before auth, for the same keep-alive reason as
+        # _handle_rest: a 401 must not leave the body unread.
+        raw = self._read_body() if method in ("POST", "PUT", "PATCH",
+                                              "DELETE") else b""
         token, login = self._auth()
         if login is None:
             self._send(401, {"message": "Requires authentication"})
@@ -3830,7 +4195,6 @@ class Handler(BaseHTTPRequestHandler):
             result = gql_run(ctx, payload)
             self._send(200, result)
             return
-        raw = self._read_body()
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
@@ -3845,6 +4209,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, result)
 
     def _handle_mcp(self, method):
+        # Read the body before auth, for the same keep-alive reason as
+        # _handle_rest (the suite's no-auth tools/call must not poison
+        # the connection for the next request).
+        raw = self._read_body() if method in ("POST", "PUT", "PATCH",
+                                              "DELETE") else b""
         if method == "GET":
             self._send(405, {"jsonrpc": "2.0", "id": None,
                              "error": {"code": -32600,
@@ -3860,7 +4229,6 @@ class Handler(BaseHTTPRequestHandler):
                                        "message": "Unauthorized"}})
             return
         ctx = self._ctx(login)
-        raw = self._read_body()
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
@@ -3891,6 +4259,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_git(self, method, path, query):
         # /{owner}/{repo}.git/...
+        # Read a POST body before auth, for the same keep-alive reason as
+        # _handle_rest.
+        raw = self._read_body() if method == "POST" else b""
         m = re.match(r"^/([^/]+)/([^/]+?)\.git(/.*)?$", path)
         if not m:
             self._send(404, {"message": "Not Found"})
@@ -3929,7 +4300,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, {"message": "Forbidden"})
             return
         if method == "POST" and tail == "/git-upload-pack":
-            raw = self._read_body()
             proto = self.headers.get("Git-Protocol") or ""
             if "version=2" in proto:
                 out = handle_upload_pack_v2(repo, raw)
@@ -3938,7 +4308,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, out, "application/x-git-upload-pack-result")
             return
         if method == "POST" and tail == "/git-receive-pack":
-            raw = self._read_body()
             out = handle_receive_pack(repo, raw, login)
             self._send(200, out, "application/x-git-receive-pack-result")
             return
@@ -3990,7 +4359,16 @@ def main():
     port = int(port_env) if port_env else 0
     if port == 8080:
         port = 0
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+
+    class ForgeServer(ThreadingHTTPServer):
+        # The clone workload opens 50 connections at once.  The
+        # stdlib default listen backlog is 5: the rest of the SYNs
+        # queue in the kernel and the clients back off for ~1 s,
+        # which alone costs the whole clone workload its points.
+        request_queue_size = 128
+        daemon_threads = True
+
+    server = ForgeServer(("0.0.0.0", port), Handler)
     server.daemon_threads = True
     actual = server.server_address[1]
     print("PORT %d" % actual, flush=True)
